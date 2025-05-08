@@ -46,8 +46,8 @@ Key modifications from the original Ambianic code include:
 ## Configuration
 
 Key parameters can be adjusted within the Python scripts:
-*   `CAMERA_SOURCE` in `oma.py`
-*   `ANALYSIS_INTERVAL_SECONDS` in `oma.py`
+*   `CAMERA_SOURCE` in `live_fall_detector.py`
+*   `ANALYSIS_INTERVAL_SECONDS` in `live_fall_detector.py`
 *   `confidence_threshold` in `fall_prediction.py` -> `_fall_detect_config()`
 *   `_fall_factor` in `src/pipeline/fall_detect.py` -> `FallDetector.__init__()`
 
