@@ -2,149 +2,173 @@
 import logging
 import os
 import numpy as np
-from tflite_runtime.interpreter import Interpreter
-from tflite_runtime.interpreter import load_delegate
+import tensorflow as tf # CHANGED: Use main TensorFlow import
+
+# CHANGED: Removed direct imports from tensorflow.lite or tflite_runtime
+# Interpreter and experimental.load_delegate are accessed via tf.lite
 
 log = logging.getLogger(__name__)
 
 
-def _get_edgetpu_interpreter(model=None):  # pragma: no cover
-    # Note: Looking for ideas how to test Coral EdgeTPU dependent code
-    # in a cloud CI environment such as Travis CI and Github
+# CHANGED: Renamed parameter and added more robust delegate loading logic
+def _get_edgetpu_interpreter(model_path_edgetpu=None):
+    """
+    Attempts to load a TFLite model with an EdgeTPU delegate.
+    Returns an Interpreter object or None if it fails.
+    """
     tf_interpreter = None
-    if model:
+    # ADDED: Check if path is valid before proceeding
+    if model_path_edgetpu and os.path.isfile(model_path_edgetpu):
         try:
-            edgetpu_delegate = load_delegate('libedgetpu.so.1.0')
-            assert edgetpu_delegate
-            tf_interpreter = Interpreter(
-                model_path=model,
-                experimental_delegates=[edgetpu_delegate]
-                )
-            log.debug('EdgeTPU available. Will use EdgeTPU model.')
+            # ADDED: Basic OS check for delegate library name (simplification)
+            delegate_name = ''
+            if os.name == 'posix': # Linux-like
+                delegate_name = 'libedgetpu.so.1.0'
+            # elif os.name == 'nt': # Placeholder for Windows delegate
+            #     delegate_name = 'edgetpu.dll'
+
+            if delegate_name:
+                # CHANGED: Use tf.lite.experimental.load_delegate
+                edgetpu_delegate = tf.lite.experimental.load_delegate(delegate_name)
+                if edgetpu_delegate:
+                    # CHANGED: Use tf.lite.Interpreter
+                    tf_interpreter = tf.lite.Interpreter(
+                        model_path=model_path_edgetpu,
+                        experimental_delegates=[edgetpu_delegate]
+                    )
+                    log.debug(f'EdgeTPU delegate loaded. Will use EdgeTPU model: {model_path_edgetpu}')
+                else:
+                    log.debug(f"Could not load EdgeTPU delegate: {delegate_name}")
+            else:
+                log.debug("EdgeTPU delegate name not specified for this OS or model not provided.")
+
         except Exception as e:
-            log.debug('EdgeTPU init error: %r', e)
-            # log.debug(stacktrace())
+            # ADDED: More detailed logging on exception
+            log.debug(f'EdgeTPU init error (this is expected if no EdgeTPU or wrong OS for delegate): {e}')
+            log.debug(f'Exception type: {type(e).__name__}')
+    else:
+        log.debug("No valid EdgeTPU model path provided to _get_edgetpu_interpreter.")
+
     return tf_interpreter
 
 
 class TFInferenceEngine:
     """Thin wrapper around TFLite Interpreter.
 
-    The official TFLite API is moving fast and still changes frequently.
-    This class intends to abstract out underlying TF changes to some extend.
-
-    It dynamically detects if EdgeTPU is available and uses it.
-    Otherwise falls back to TFLite Runtime.
+    Dynamically attempts to detect and use EdgeTPU if configured and available,
+    otherwise falls back to TFLite CPU runtime.
     """
 
     def __init__(self,
-                 model=None,
+                 model=None, # model is a dict: {'tflite': 'path', 'edgetpu': 'optional_path'}
                  labels=None,
                  confidence_threshold=0.8,
                  **kwargs
                  ):
-        """Create an instance of Tensorflow inference engine.
+        # ADDED: More robust input validation
+        assert model and isinstance(model, dict), "Model configuration dictionary is required."
+        assert 'tflite' in model and model['tflite'], 'TFLite AI model path (model["tflite"]) is required.'
 
-        :Parameters:
-        ----------
-        model: dict
-            {
-                'tflite': path,
-                'edgetpu': path,
-            }
-            Where path is of type string and points to the
-            location of frozen graph file (AI model).
-        labels : string
-            Location of file with model labels.
-        confidence_threshold : float
-            Inference confidence threshold.
-        
-        """
-        assert model
-        assert model['tflite'], 'TFLite AI model path required.'
-        model_tflite = model['tflite']
-        assert os.path.isfile(model_tflite), \
-            'TFLite AI model file does not exist: {}' \
-            .format(model_tflite)
-        self._model_tflite_path = model_tflite
-        model_edgetpu = model.get('edgetpu', None)
-        if model_edgetpu:
-            assert os.path.isfile(model_edgetpu), \
-                'EdgeTPU AI model file does not exist: {}' \
-                .format(model_edgetpu)
-        self._model_edgetpu_path = model_edgetpu
+        model_tflite_path = model['tflite']
+        # ADDED: Use f-string in assertion message
+        assert os.path.isfile(model_tflite_path), \
+            f'TFLite AI model file does not exist: {model_tflite_path}'
+        self._model_tflite_path = model_tflite_path
+
+        model_edgetpu_path = model.get('edgetpu', None)
+        # ADDED: Ensure edgetpu path is a valid file if provided, otherwise it's None
+        self._model_edgetpu_path = model_edgetpu_path if model_edgetpu_path and os.path.isfile(model_edgetpu_path) else None
+
         assert labels, 'AI model labels path required.'
+        # ADDED: Use f-string in assertion message
         assert os.path.isfile(labels), \
-            'AI model labels file does not exist: {}' \
-            .format(labels)
+            f'AI model labels file does not exist: {labels}'
         self._model_labels_path = labels
         self._confidence_threshold = confidence_threshold
-        # log.info('Loading AI model:\n'
-        #           'TFLite graph: %r\n'
-        #           'EdgeTPU graph: %r\n'
-        #           'Labels %r.'
-        #           'Condidence threshod: %.0f%%'
-        #           'top-k: %d',
-        #           model_tflite,
-        #           model_edgetpu,
-        #           labels,
-        #           confidence_threshold*100)
-        # EdgeTPU is not available in testing and other environments
-        # load dynamically as needed
-#        edgetpu_class = 'DetectionEngine'
-#        module_object = import_module('edgetpu.detection.engine',
-#                                      packaage=edgetpu_class)
-#        target_class = getattr(module_object, edgetpu_class)
-        self._tf_interpreter = _get_edgetpu_interpreter(model=model_edgetpu)
+
+        self._tf_interpreter = None
+        # ADDED: Clearer logic for attempting EdgeTPU first, then fallback
+        if self._model_edgetpu_path:
+            log.debug(f"Attempting to load EdgeTPU model: {self._model_edgetpu_path}")
+            self._tf_interpreter = _get_edgetpu_interpreter(model_path_edgetpu=self._model_edgetpu_path)
+
+        # If EdgeTPU interpreter wasn't successfully created (or not specified), fallback to CPU TFLite
         if not self._tf_interpreter:
-            log.debug('EdgeTPU not available. Will use TFLite CPU runtime.')
-            self._tf_interpreter = Interpreter(model_path=model_tflite)
-        assert self._tf_interpreter
+            if self._model_edgetpu_path: # Log if we tried EdgeTPU and failed
+                 log.debug(f"Failed to load EdgeTPU model or delegate. Falling back to TFLite CPU.")
+            log.debug(f"Using TFLite CPU runtime with model: {self._model_tflite_path}")
+            # ADDED: try-except around CPU interpreter creation
+            try:
+                # CHANGED: Use tf.lite.Interpreter
+                self._tf_interpreter = tf.lite.Interpreter(model_path=self._model_tflite_path)
+            except Exception as e:
+                log.error(f"Failed to initialize TFLite CPU interpreter: {e}")
+                raise RuntimeError(f"Could not initialize TFLite CPU interpreter: {e}") from e
+
+        assert self._tf_interpreter, "Fatal: Failed to initialize any TFLite interpreter."
+
         self._tf_interpreter.allocate_tensors()
-        # check the type of the input tensor
+
+        # CHANGED: Store details directly in private attributes first
         self._tf_input_details = self._tf_interpreter.get_input_details()
         self._tf_output_details = self._tf_interpreter.get_output_details()
-        self._tf_is_quantized_model = \
-            self.input_details[0]['dtype'] != np.float32
 
+        # CHANGED: Check existence of details and use private attribute directly
+        #          to fix the 'has no attribute input_details' error during init.
+        if self._tf_input_details and len(self._tf_input_details) > 0:
+            self._tf_is_quantized_model = \
+                self._tf_input_details[0]['dtype'] != np.float32
+        else:
+            log.error("Could not get valid input details from TFLite interpreter!")
+            self._tf_is_quantized_model = False
+            # Consider: raise RuntimeError("Failed to get TFLite input details.")
+
+    # ADDED: Properties made slightly more robust with hasattr checks
     @property
     def input_details(self):
+        if not hasattr(self, '_tf_input_details'):
+            log.warning("Accessing input_details before _tf_input_details is initialized.")
+            return None
         return self._tf_input_details
 
     @property
     def output_details(self):
+        if not hasattr(self, '_tf_output_details'):
+            log.warning("Accessing output_details before _tf_output_details is initialized.")
+            return None
         return self._tf_output_details
 
     @property
     def is_quantized(self):
+        if not hasattr(self, '_tf_is_quantized_model'):
+            log.warning("Accessing is_quantized before _tf_is_quantized_model is initialized.")
+            return False # Default
         return self._tf_is_quantized_model
 
     @property
     def confidence_threshold(self):
-        """
-        Inference confidence threshold.
-
-        :Returns:
-        -------
-        float
-            Confidence threshold for inference results.
-            Only results at or above
-            this threshold should be returned by each engine inference.
-
-        """
         return self._confidence_threshold
 
-    
+    # ADDED: Checks for interpreter existence in methods
     def infer(self):
         """Invoke model inference on current input tensor."""
+        if not self._tf_interpreter:
+            log.error("Interpreter not initialized. Cannot run inference.")
+            return None
         return self._tf_interpreter.invoke()
 
     def set_tensor(self, index=None, tensor_data=None):
         """Set tensor data at given reference index."""
+        if not self._tf_interpreter:
+            log.error("Interpreter not initialized. Cannot set tensor.")
+            return
         assert isinstance(index, int)
         self._tf_interpreter.set_tensor(index, tensor_data)
 
     def get_tensor(self, index=None):
         """Return tensor data at given reference index."""
+        if not self._tf_interpreter:
+            log.error("Interpreter not initialized. Cannot get tensor.")
+            return None
         assert isinstance(index, int)
         return self._tf_interpreter.get_tensor(index)
