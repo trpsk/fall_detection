@@ -32,7 +32,6 @@ Key modifications from the original Ambianic code include:
     pip install opencv-python Pillow numpy PyYAML tensorflow matplotlib
     # Make sure TensorFlow (CPU or GPU version) is installed correctly
     ```
-3.  **File Structure:** Ensure `fall_prediction.py`, the `src` directory, and the `ai_models` directory are present.
 
 ## Running
 
